@@ -11,6 +11,7 @@
 #include "miniz.h"
 
 #include <Windows.h>
+#include <mmsystem.h>
 #include <ShObjIdl.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -305,6 +306,7 @@ struct App {
     std::map<std::string, fs::path> playlist_artwork;
     std::set<std::string> generated_playlist_artwork;
     Renderer* renderer{};
+    ImFont* preview_icon_font{};
     ImTextureID artwork_preview{};
     std::string artwork_preview_label, artwork_preview_error;
     std::uint64_t artwork_preview_generation{}; // UI-owned; workers capture a value, never read it
@@ -329,6 +331,9 @@ struct App {
     std::optional<std::pair<bool, std::string>> finished;       // a build's result: ok, message
     std::optional<ArtworkPreviewResult> artwork_preview_ready; // guarded by mutex
     std::optional<FfmpegInstallResult> ffmpeg_install;          // a download's result, guarded by mutex
+    std::optional<fs::path> preview_ready;                     // guarded by mutex
+    bool previewing{};
+    fs::path preview_source;
 
     std::vector<fs::path> dropped;
     std::mutex dropped_mutex;
@@ -781,6 +786,34 @@ void readd_audio(App& app, std::size_t index, HWND window) {
         app.progress = 1.0f;
     });
     set_status(app, "Re-added source audio for track " + std::to_string(index + 1) + ".");
+}
+
+void stop_preview(App& app) {
+    PlaySoundW(nullptr, nullptr, 0);
+    app.previewing = false;
+    app.preview_source.clear();
+    std::lock_guard lock(app.mutex);
+    if (app.preview_ready) {
+        std::error_code ec;
+        fs::remove(*app.preview_ready, ec);
+        app.preview_ready.reset();
+    }
+}
+
+void preview_audio(App& app, const fs::path& source) {
+    if (app.busy || !fs::is_regular_file(source)) return;
+    stop_preview(app);
+    app.preview_source = source;
+    start(app, "Preparing preview", [&app, source] {
+        try {
+            const auto wav = music::preview_audio(source);
+            std::lock_guard lock(app.mutex);
+            app.preview_ready = wav;
+        } catch (const std::exception& error) {
+            std::lock_guard lock(app.mutex);
+            app.finished = {false, error.what()};
+        }
+    });
 }
 
 void open_mod(App& app, const fs::path& folder) {
@@ -1774,8 +1807,9 @@ void songs_page(App& app, HWND window) {
 
             const float btn_w1 = S(165.0f);
             const float btn_w2 = S(145.0f);
+            const float btn_w3 = S(145.0f);
             const float btn_spacing = S(14.0f);
-            const float total_btn_w = btn_w1 + btn_spacing + btn_w2;
+            const float total_btn_w = btn_w1 + btn_spacing + btn_w2 + btn_spacing + btn_w3;
             if (card_avail > total_btn_w) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (card_avail - total_btn_w) * 0.5f);
             }
@@ -1796,6 +1830,15 @@ void songs_page(App& app, HWND window) {
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.20f, 0.25f, 1.00f));
             if (ImGui::Button("Add Folder...", ImVec2(btn_w2, S(34.0f)))) {
                 add_files(app, pick(window, true));
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::SameLine(0, btn_spacing);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.24f, 0.30f, 0.95f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.27f, 0.32f, 0.40f, 1.00f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.20f, 0.25f, 1.00f));
+            if (ImGui::Button("Open Save...", ImVec2(btn_w3, S(34.0f)))) {
+                const auto files = pick(window, false, false, false, {}, true);
+                if (!files.empty()) { app.save_file = files[0]; open_saved_file(app, files[0]); }
             }
             ImGui::PopStyleColor(3);
             ImGui::EndDisabled();
@@ -1882,7 +1925,7 @@ void songs_page(App& app, HWND window) {
             ImGui::TableSetupColumn("Playlist (?)", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthFixed, S(64));
             ImGui::TableSetupColumn("Problems", ImGuiTableColumnFlags_WidthStretch, 0.9f);
-            ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, S(175));
+            ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, S(230));
 
             const int columns_count = ImGui::TableGetColumnCount();
             ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
@@ -1946,6 +1989,18 @@ void songs_page(App& app, HWND window) {
                 if (ImGui::BeginPopupContextItem("row_context")) {
                     ImGui::TextDisabled("%s - %s", row.artist.data(), row.title.data());
                     ImGui::Separator();
+                    const bool can_preview = row.source_available && fs::is_regular_file(row.file);
+                    const bool is_this_preview = app.previewing && app.preview_source == row.file;
+                    if (ImGui::MenuItem(is_this_preview ? "Stop Preview" : "Preview Audio", nullptr, false,
+                                        is_this_preview || can_preview)) {
+                        if (is_this_preview) stop_preview(app);
+                        else preview_audio(app, row.file);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(is_this_preview ? "Stop previewing this track." : can_preview ?
+                                                         "Preview this track." :
+                                                         "The source audio file is not available.");
+                    if (app.previewing && !is_this_preview && ImGui::MenuItem("Stop Preview")) stop_preview(app);
                     if (ImGui::MenuItem("Re-add Source Audio...", nullptr, false, !busy)) {
                         readd_audio(app, i, window);
                     }
@@ -2064,6 +2119,23 @@ void songs_page(App& app, HWND window) {
                 // Actions column
                 ImGui::TableNextColumn();
                 ImGui::BeginDisabled(busy);
+
+                const bool can_preview = row.source_available && fs::is_regular_file(row.file);
+                const bool is_this_preview = app.previewing && app.preview_source == row.file;
+                ImGui::BeginDisabled(!can_preview && !is_this_preview);
+                if (app.preview_icon_font) ImGui::PushFont(app.preview_icon_font);
+                if (ImGui::Button(is_this_preview ? "\xEE\x9D\xA9##preview" : "\xEE\x9D\xA8##preview")) {
+                    if (is_this_preview) stop_preview(app);
+                    else preview_audio(app, row.file);
+                }
+                if (app.preview_icon_font) ImGui::PopFont();
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(is_this_preview ? "Stop this preview" :
+                                      (can_preview ? "Preview this track" : "The source audio file is not available."));
+                }
+                ImGui::EndDisabled();
+
+                ImGui::SameLine();
                 ImGui::BeginDisabled(!prev_matching.has_value());
                 if (ImGui::ArrowButton("up", ImGuiDir_Up)) up_target = std::make_pair(i, *prev_matching);
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move song up");
@@ -2518,6 +2590,23 @@ void frame(App& app, HWND window) {
         }
     }
     {
+        std::optional<fs::path> preview;
+        {
+            std::lock_guard lock(app.mutex);
+            preview = std::move(app.preview_ready);
+            app.preview_ready.reset();
+        }
+        if (preview) {
+            if (PlaySoundW(preview->c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT)) {
+                app.previewing = true;
+            } else {
+                std::error_code ec;
+                fs::remove(*preview, ec);
+                set_status(app, "Could not start audio preview.", true);
+            }
+        }
+    }
+    {
         std::lock_guard lock(app.mutex);
         if (app.finished) {
             set_status(app, app.finished->second, !app.finished->first);
@@ -2767,6 +2856,19 @@ int run_gui(HINSTANCE instance, int /*cmd_show*/) {
     GetWindowsDirectoryW(windows, MAX_PATH);
     const auto font = fs::path(windows) / L"Fonts" / L"segoeui.ttf";
     if (fs::exists(font)) io.Fonts->AddFontFromFileTTF(narrow(font.wstring()).c_str(), S(18.0f));
+    const auto symbol_font = fs::path(windows) / L"Fonts" / L"seguisym.ttf";
+    if (fs::exists(font) && fs::exists(symbol_font)) {
+        ImFontConfig symbol_config;
+        symbol_config.MergeMode = true;
+        const ImWchar symbol_ranges[] = { 0x23F8, 0x23F8, 0x25B6, 0x25B6, 0 };
+        io.Fonts->AddFontFromFileTTF(narrow(symbol_font.wstring()).c_str(), S(18.0f), &symbol_config, symbol_ranges);
+    }
+    ImFont* preview_icon_font = nullptr;
+    const auto mdl2_font = fs::path(windows) / L"Fonts" / L"segmdl2.ttf";
+    if (fs::exists(mdl2_font)) {
+        const ImWchar mdl2_ranges[] = { 0xE768, 0xE769, 0 };
+        preview_icon_font = io.Fonts->AddFontFromFileTTF(narrow(mdl2_font.wstring()).c_str(), S(18.0f), nullptr, mdl2_ranges);
+    }
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(g_scale);
     ImGui_ImplWin32_Init(window);
@@ -2779,6 +2881,7 @@ int run_gui(HINSTANCE instance, int /*cmd_show*/) {
     auto app_storage = std::make_unique<App>();
     auto& app = *app_storage;
     app.renderer = &renderer;
+    app.preview_icon_font = preview_icon_font;
     g_app = &app;
     app.settings = load_settings();
     app.ffmpeg = find_ffmpeg(app.settings.ffmpeg);

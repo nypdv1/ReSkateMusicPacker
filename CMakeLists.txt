@@ -96,6 +96,7 @@ target_link_libraries(ReSkateMusicPacker PRIVATE
     music_packer_lib
     imgui
     windowscodecs
+    winmm
     shell32
     ole32
     dwmapi

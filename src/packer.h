@@ -77,6 +77,8 @@ std::vector<SongInfo> scan(std::span<const std::filesystem::path> files);
 std::filesystem::path embedded_artwork(const std::filesystem::path& track);
 // Proportionally resized 512x512 PNG with dark padding; shared by packing and previews.
 std::vector<std::byte> image_artwork_png(const std::filesystem::path& image);
+// Decodes one source track to a temporary WAV for the GUI's in-app preview.
+std::filesystem::path preview_audio(const std::filesystem::path& source);
 // Deterministic 512x512 text cover, also used by the GUI preview. UTF-8 playlist name.
 std::vector<std::byte> playlist_artwork_png(const std::string& name);
 

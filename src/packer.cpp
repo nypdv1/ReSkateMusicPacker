@@ -1076,6 +1076,16 @@ namespace music {
 
 bool usable_name(const std::string& text) { return usable(text); }
 
+fs::path preview_audio(const fs::path& source) {
+    if (!fs::is_regular_file(source)) throw std::runtime_error("Source audio file is missing: " + narrow(source.wstring()));
+    const auto output = scratch_folder() / (L"audio-preview-" + std::to_wstring(GetTickCount64()) + L".wav");
+    std::error_code ec;
+    fs::remove(output, ec);
+    run(L"ffmpeg -y -v error -i \"" + source.wstring() +
+        L"\" -vn -map_metadata -1 -ac 2 -ar 48000 -f wav \"" + output.wstring() + L"\"");
+    return output;
+}
+
 namespace {
 // Smart quote / apostrophe sequences folded onto ASCII. The trailing rows are the
 // double-encoded ("â€™") forms that mis-tagged files produce for the same characters.
