@@ -35,6 +35,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <map>
 #include <set>
@@ -42,6 +43,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -193,8 +195,12 @@ std::string run_process(const std::wstring& command, bool capture, DWORD& exit_c
 }
 void run(const std::wstring& command) {
     DWORD exit_code{};
-    run_process(command, false, exit_code);
-    if (exit_code != 0) throw std::runtime_error("Command failed: " + narrow(command));
+    const auto output = run_process(command, true, exit_code);
+    if (exit_code != 0) {
+        auto detail = output;
+        while (!detail.empty() && (detail.back() == '\r' || detail.back() == '\n' || detail.back() == ' ')) detail.pop_back();
+        throw std::runtime_error("Command failed: " + narrow(command) + (detail.empty() ? "" : "\nFFmpeg: " + detail));
+    }
 }
 std::string run_capture(const std::wstring& command) {
     DWORD exit_code{};
@@ -803,12 +809,32 @@ music::PackResult build(const music::PackOptions& options, const fs::path& out, 
         song.slug = music::unique_slug(song.slug, slugs);
         songs.push_back(std::move(song));
     }
+
+    // Encoding is independent per source file. Run a bounded batch of FFmpeg jobs in parallel,
+    // then consume the results below in the original order so bundle IDs, TOC entries, and output
+    // remain deterministic.
+    std::vector<EncodedOpus> encodedSongs(songs.size());
+    const auto workerCount = std::max<unsigned>(1, std::thread::hardware_concurrency());
+    for (std::size_t batch = 0; batch < songs.size(); batch += workerCount) {
+        if (cancel && *cancel) throw music::Cancelled();
+        const auto end = std::min(songs.size(), batch + static_cast<std::size_t>(workerCount));
+        std::vector<std::future<EncodedOpus>> jobs;
+        jobs.reserve(end - batch);
+        for (std::size_t index = batch; index < end; ++index) {
+            report(index, "encoding");
+            jobs.push_back(std::async(std::launch::async, [&songs, &scratch, index, &options] {
+                return encode(songs[index], options.bitrate, options.normalize, scratch);
+            }));
+        }
+        for (std::size_t index = batch; index < end; ++index) {
+            encodedSongs[index] = jobs[index - batch].get();
+            if (cancel && *cancel) throw music::Cancelled();
+        }
+    }
     for (std::size_t index = 0; index < songs.size(); ++index) {
         if (cancel && *cancel) throw music::Cancelled();
         const auto& song = songs[index];
-        report(index, "encoding");
-
-        const auto encoded = encode(song, options.bitrate, options.normalize, scratch);
+        const auto& encoded = encodedSongs[index];
         const auto& opus = encoded.opus;
         const auto samples = playable_samples(opus);
         const auto header = codec_header(templateHeader, samples);
@@ -1103,20 +1129,6 @@ std::string unique_slug(const std::string& base, std::set<std::string>& used) {
     return candidate;
 }
 
-std::vector<std::byte> image_artwork_png(const fs::path& image) {
-    const auto temporary = scratch_folder() / L"image-preview.png";
-    std::error_code ignored;
-    fs::remove(temporary, ignored);
-    try {
-        run(L"ffmpeg -y -v error -i \"" + image.wstring() +
-            L"\" -an -vf \"" + artwork_filter + L"\" -frames:v 1 -update 1 \"" +
-            temporary.wstring() + L"\"");
-        auto bytes = read_file(temporary);
-        fs::remove(temporary, ignored);
-        return bytes;
-    } catch (...) { fs::remove(temporary, ignored); throw; }
-}
-
 fs::path embedded_artwork(const fs::path& track) {
     fs::path temporary;
     try {
@@ -1213,9 +1225,13 @@ PackResult pack(const PackOptions& options, const std::vector<SongInfo>& songs, 
 }
 
 Project load_project(const fs::path& mod) {
-    const auto path = mod / L"reskate-music-project.json";
+    auto path = mod / L"reskate-music-project.json";
     std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error(narrow(mod.filename().wstring()) + " has no project file (it was made before they existed); "
+    if (!in) {
+        path = mod / L"reskate-music-project.json.bak";
+        in.open(path, std::ios::binary);
+    }
+    if (!in) throw std::runtime_error(narrow(mod.filename().wstring()) + " has no project file or backup (it was made before they existed); "
                                       "make it again from its song files");
     try {
         const auto root = Json::parse(std::string(std::istreambuf_iterator<char>(in), {}));

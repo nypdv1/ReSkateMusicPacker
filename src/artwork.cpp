@@ -6,6 +6,8 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <vector>
 
 namespace music {
 namespace {
@@ -58,6 +60,32 @@ std::wstring wrapped(HDC dc, std::wstring text, int width, int& lines) {
         text.erase(0, count);
         while (!text.empty() && text.front() == L' ') text.erase(0, 1);
     }
+    return result;
+}
+
+std::vector<std::byte> encode_image_png(const std::vector<unsigned char>& pixels) {
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    require(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))));
+    require(SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)));
+    require(SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)));
+    require(SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)));
+    require(SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr)));
+    require(SUCCEEDED(frame->SetSize(512, 512)));
+    auto format = GUID_WICPixelFormat32bppBGRA;
+    require(SUCCEEDED(frame->SetPixelFormat(&format)) && format == GUID_WICPixelFormat32bppBGRA);
+    require(SUCCEEDED(frame->WritePixels(512, 512 * 4, static_cast<UINT>(pixels.size()), const_cast<BYTE*>(pixels.data()))));
+    require(SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit()));
+    STATSTG stat{};
+    require(SUCCEEDED(stream->Stat(&stat, STATFLAG_NONAME)));
+    HGLOBAL global{};
+    require(SUCCEEDED(GetHGlobalFromStream(stream.Get(), &global)));
+    const auto* bytes = static_cast<const std::byte*>(GlobalLock(global));
+    require(bytes != nullptr);
+    std::vector<std::byte> result(bytes, bytes + static_cast<std::size_t>(stat.cbSize.QuadPart));
+    GlobalUnlock(global);
     return result;
 }
 }
@@ -136,5 +164,42 @@ std::vector<std::byte> playlist_artwork_png(const std::string& name) {
     std::vector<std::byte> result(bytes, bytes + static_cast<std::size_t>(stat.cbSize.QuadPart));
     GlobalUnlock(global);
     return result;
+}
+
+std::vector<std::byte> image_artwork_png(const std::filesystem::path& image) {
+    Com com;
+    if (FAILED(com.status) && com.status != RPC_E_CHANGED_MODE) throw std::runtime_error("Could not initialize image decoding");
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> source;
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->CreateDecoderFromFilename(image.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder)) ||
+        FAILED(decoder->GetFrame(0, &source)) || FAILED(factory->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(source.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeCustom)))
+        throw std::runtime_error("Could not load image: " + image.string());
+
+    UINT width{}, height{};
+    require(SUCCEEDED(converter->GetSize(&width, &height)) && width && height);
+    const auto scale = 512.0 / std::max(width, height);
+    const UINT scaledWidth = std::max<UINT>(1, static_cast<UINT>(width * scale));
+    const UINT scaledHeight = std::max<UINT>(1, static_cast<UINT>(height * scale));
+    ComPtr<IWICBitmapScaler> scaler;
+    require(SUCCEEDED(factory->CreateBitmapScaler(&scaler)) &&
+            SUCCEEDED(scaler->Initialize(converter.Get(), scaledWidth, scaledHeight, WICBitmapInterpolationModeFant)));
+
+    std::vector<unsigned char> pixels(512 * 512 * 4, 0);
+    for (std::size_t p = 0; p < pixels.size(); p += 4) {
+        pixels[p] = 0x35; pixels[p + 1] = 0x20; pixels[p + 2] = 0x24; pixels[p + 3] = 255;
+    }
+    const UINT stride = scaledWidth * 4;
+    std::vector<unsigned char> scaled(static_cast<std::size_t>(stride) * scaledHeight);
+    require(SUCCEEDED(scaler->CopyPixels(nullptr, stride, static_cast<UINT>(scaled.size()), scaled.data())));
+    const UINT left = (512 - scaledWidth) / 2, top = (512 - scaledHeight) / 2;
+    for (UINT y = 0; y < scaledHeight; ++y)
+        std::memcpy(pixels.data() + (static_cast<std::size_t>(top + y) * 512 + left) * 4,
+                    scaled.data() + static_cast<std::size_t>(y) * stride, stride);
+    return encode_image_png(pixels);
 }
 }
