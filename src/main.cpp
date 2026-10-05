@@ -314,6 +314,7 @@ struct App {
     fs::path save_file;
     bool thunderstore_read_only{}; // imported packages have no source audio to rebuild
     std::uint64_t last_autosave{};
+    std::string autosave_signature;
     std::string status;
     bool status_error{};
 
@@ -367,15 +368,22 @@ fs::path output_folder(const App& app) {
     return !app.output.empty() ? app.output : app.settings.game / L"Mods" / folder_name(app.name.data());
 }
 
+Json editor_save_json(const App& app);
+
 // Keep the editor state independent of Build. The last few backups make the destructive New Mod
 // button recoverable even if the user changed tags or playlists since the previous build.
 void autosave_project(App& app, bool force = false) {
     if (app.thunderstore_read_only || app.rows.empty() || !app.name[0] || !app.playlist[0]) return;
     const auto now = GetTickCount64();
     if (!force && now - app.last_autosave < 1000) return;
-    const auto folder = output_folder(app);
+    const auto folder = !app.output.empty() ? app.output : settings_file().parent_path() / L"autosave";
     const auto path = folder / L"reskate-music-project.json";
     try {
+        const auto serialized = editor_save_json(app).dump(2) + "\n";
+        if (serialized == app.autosave_signature) {
+            app.last_autosave = now;
+            return;
+        }
         fs::create_directories(folder);
         if (fs::exists(path)) {
             std::error_code ec;
@@ -387,38 +395,16 @@ void autosave_project(App& app, bool force = false) {
             }
             fs::copy_file(path, folder / L"reskate-music-project.json.bak", fs::copy_options::overwrite_existing, ec);
         }
-        auto root = Json::object();
-        root["schema"] = 1;
-        root["name"] = app.name.data();
-        root["playlist"] = app.playlist.data();
-        root["bitrate"] = std::stoi(bitrates[app.bitrate]);
-        root["normalize"] = app.normalize;
-        auto playlistArt = Json::object();
-        for (const auto& [name, image] : app.playlist_artwork)
-            if (!image.empty()) playlistArt[name] = narrow(fs::absolute(image).wstring());
-        root["playlist_artwork"] = std::move(playlistArt);
-        root["generated_playlist_artwork"] = Json::array();
-        for (const auto& name : app.generated_playlist_artwork) root["generated_playlist_artwork"].push_back(name);
-        auto songs = Json::array();
-        for (const auto& row : app.rows) {
-            auto song = Json::object();
-            song["file"] = narrow(fs::absolute(row.file).wstring());
-            song["artist"] = row.artist.data();
-            song["title"] = row.title.data();
-            if (row.playlist[0]) song["playlist"] = row.playlist.data();
-            if (!row.artwork.empty()) song["artwork"] = narrow(fs::absolute(row.artwork).wstring());
-            songs.push_back(std::move(song));
-        }
-        root["songs"] = std::move(songs);
         const auto temporary = path.wstring() + L".tmp";
         std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        out << root.dump(2) << "\n";
+        out << serialized;
         out.close();
         std::error_code ec;
         fs::remove(path, ec);
         fs::rename(temporary, path, ec);
         if (ec) fs::copy_file(temporary, path, fs::copy_options::overwrite_existing, ec);
         fs::remove(temporary, ec);
+        app.autosave_signature = serialized;
         app.last_autosave = now;
     } catch (...) {
         // Autosave must never interrupt editing; the normal Build error still reports write failures.
@@ -462,6 +448,75 @@ void save_editor_file(App& app, const fs::path& path) {
         out << editor_save_json(app).dump(2) << "\n";
         set_status(app, "Saved " + narrow(path.filename().wstring()) + ".");
     } catch (const std::exception& error) { set_status(app, error.what(), true); }
+}
+
+std::vector<std::byte> read_save_bytes(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<char> raw((std::istreambuf_iterator<char>(in)), {});
+    if (!in && raw.empty()) throw std::runtime_error("Cannot read " + narrow(path.wstring()));
+    std::vector<std::byte> bytes(raw.size());
+    if (!raw.empty()) std::memcpy(bytes.data(), raw.data(), raw.size());
+    return bytes;
+}
+
+void save_portable_file(App& app, const fs::path& path) {
+    if (path.empty() || app.rows.empty()) return;
+    const auto staging = fs::temp_directory_path() / L"ReSkateMusicPacker" /
+                         (L"portable_save-" + std::to_wstring(GetTickCount64()));
+    try {
+        fs::create_directories(staging);
+        auto root = editor_save_json(app);
+        auto copy_asset = [&](const fs::path& source, const fs::path& relative) {
+            if (source.empty() || !fs::is_regular_file(source)) throw std::runtime_error("Missing save asset: " + narrow(source.wstring()));
+            const auto destination = staging / relative;
+            fs::create_directories(destination.parent_path());
+            std::error_code ec;
+            fs::copy_file(source, destination, fs::copy_options::overwrite_existing, ec);
+            if (ec) throw std::runtime_error("Could not copy save asset: " + narrow(source.wstring()));
+            return relative.generic_string();
+        };
+        auto& songs = root["songs"];
+        for (std::size_t i = 0; i < songs.size(); ++i) {
+            const auto source = fs::path(widen(songs[i]["file"].string()));
+            const auto relative = fs::path(L"audio") / (std::to_wstring(i) + source.extension().wstring());
+            songs[i]["file"] = copy_asset(source, relative);
+            if (songs[i].contains("artwork")) {
+                const auto artwork = fs::path(widen(songs[i]["artwork"].string()));
+                songs[i]["artwork"] = copy_asset(artwork, fs::path(L"artwork") / (L"track-" + std::to_wstring(i) + artwork.extension().wstring()));
+            }
+        }
+        auto& playlistArt = root["playlist_artwork"];
+        std::size_t playlistIndex = 0;
+        for (auto& [name, image] : playlistArt.items()) {
+            const auto source = fs::path(widen(image.string()));
+            image = copy_asset(source, fs::path(L"artwork") / (L"playlist-" + std::to_wstring(playlistIndex++) + source.extension().wstring()));
+        }
+        std::ofstream manifest(staging / L"save.json", std::ios::binary);
+        manifest << root.dump(2) << "\n";
+        manifest.close();
+
+        mz_zip_archive zip{};
+        if (!mz_zip_writer_init_heap(&zip, 0, 0)) throw std::runtime_error("Could not create portable save");
+        struct Guard { mz_zip_archive* zip; ~Guard() { mz_zip_writer_end(zip); } } guard{&zip};
+        for (const auto& entry : fs::recursive_directory_iterator(staging)) {
+            if (!entry.is_regular_file()) continue;
+            const auto name = fs::relative(entry.path(), staging).generic_string();
+            const auto bytes = read_save_bytes(entry.path());
+            if (!mz_zip_writer_add_mem(&zip, name.c_str(), bytes.data(), bytes.size(), static_cast<mz_uint>(MZ_DEFAULT_COMPRESSION)))
+                throw std::runtime_error("Could not add portable save entry: " + name);
+        }
+        void* buffer{};
+        std::size_t size{};
+        if (!mz_zip_writer_finalize_heap_archive(&zip, &buffer, &size) || !buffer)
+            throw std::runtime_error("Could not finalize portable save");
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(static_cast<const char*>(buffer), static_cast<std::streamsize>(size));
+        mz_free(buffer);
+        if (!out) throw std::runtime_error("Could not write portable save: " + narrow(path.wstring()));
+        set_status(app, "Saved portable " + narrow(path.filename().wstring()) + ".");
+    } catch (const std::exception& error) { set_status(app, error.what(), true); }
+    std::error_code ignored;
+    fs::remove_all(staging, ignored);
 }
 
 // Scans other installed mods in Mods/ and the game's content cache for existing songs to warn on clash.
@@ -745,6 +800,7 @@ void open_mod(App& app, const fs::path& folder) {
         app.generated_playlist_artwork = project.generated_playlist_artwork;
         app.output = folder;
         app.save_file.clear();
+        app.autosave_signature.clear();
         app.thunderstore_read_only = false;
         {
             std::lock_guard lock(app.mutex);
@@ -784,7 +840,14 @@ void open_mod(App& app, const fs::path& folder) {
 
 void open_saved_file(App& app, const fs::path& path) {
     try {
-        std::ifstream in(path, std::ios::binary);
+        const auto bytes = read_save_bytes(path);
+        fs::path saveRoot = path.parent_path();
+        fs::path manifestPath = path;
+        if (bytes.size() >= 2 && bytes[0] == std::byte{'P'} && bytes[1] == std::byte{'K'}) {
+            saveRoot = extract_thunderstore(path);
+            manifestPath = saveRoot / L"save.json";
+        }
+        std::ifstream in(manifestPath, std::ios::binary);
         if (!in) throw std::runtime_error("Cannot read save file: " + narrow(path.wstring()));
         const auto root = Json::parse(std::string(std::istreambuf_iterator<char>(in), {}));
         if (root.value("schema", 0) != 1) throw std::runtime_error("unsupported save schema");
@@ -793,15 +856,19 @@ void open_saved_file(App& app, const fs::path& path) {
         project.playlist = root.at("playlist").string();
         project.bitrate = root.at("bitrate").get<int>();
         project.normalize = root.contains("normalize") ? root.at("normalize").get<bool>() : true;
-        if (root.contains("playlist_artwork"))
-            for (const auto& [name, image] : root.at("playlist_artwork").items())
-                project.playlist_artwork[name] = fs::path(widen(image.string()));
         if (root.contains("generated_playlist_artwork"))
             for (const auto& name : root.at("generated_playlist_artwork")) project.generated_playlist_artwork.insert(name.string());
+        const auto resolve = [&](const std::string& value) {
+            const fs::path candidate = widen(value);
+            return candidate.is_absolute() ? candidate : saveRoot / candidate;
+        };
+        if (root.contains("playlist_artwork"))
+            for (const auto& [name, image] : root.at("playlist_artwork").items())
+                project.playlist_artwork[name] = resolve(image.string());
         for (const auto& song : root.at("songs")) {
-            music::SongInfo info{fs::path(widen(song.at("file").string())), song.at("artist").string(), song.at("title").string()};
+            music::SongInfo info{resolve(song.at("file").string()), song.at("artist").string(), song.at("title").string()};
             if (song.contains("playlist")) info.playlist = song.at("playlist").string();
-            if (song.contains("artwork")) info.artwork = fs::path(widen(song.at("artwork").string()));
+            if (song.contains("artwork")) info.artwork = resolve(song.at("artwork").string());
             project.songs.push_back(std::move(info));
         }
         clear_artwork_preview(app);
@@ -817,6 +884,7 @@ void open_saved_file(App& app, const fs::path& path) {
         app.playlist_artwork = project.playlist_artwork;
         app.generated_playlist_artwork = project.generated_playlist_artwork;
         app.output.clear();
+        app.autosave_signature.clear();
         app.thunderstore_read_only = false;
         {
             std::lock_guard lock(app.mutex);
@@ -879,6 +947,7 @@ void open_thunderstore(App& app, fs::path package) {
         app.playlist.fill(0);
         app.output = folder;
         app.save_file.clear();
+        app.autosave_signature.clear();
         app.thunderstore_read_only = true;
 
         bool firstPlaylist = true;
@@ -1282,8 +1351,7 @@ void songs_page(App& app, HWND window) {
     const auto& style = ImGui::GetStyle();
     const float new_btn_w = ImGui::CalcTextSize("New Mod").x + style.FramePadding.x * 2.0f;
     const float open_btn_w = ImGui::CalcTextSize("Open Mod...").x + style.FramePadding.x * 2.0f;
-    const float save_btn_w = ImGui::CalcTextSize("Save As...").x + style.FramePadding.x * 2.0f;
-    const float load_btn_w = ImGui::CalcTextSize("Load Save...").x + style.FramePadding.x * 2.0f;
+    const float file_btn_w = ImGui::CalcTextSize("File...").x + style.FramePadding.x * 2.0f;
     const float name_input_w = S(170.0f);
     const float playlist_input_w = S(160.0f);
     const float cover_btn_w = ImGui::CalcTextSize(artBtnLabel.c_str()).x + style.FramePadding.x * 2.0f;
@@ -1292,7 +1360,7 @@ void songs_page(App& app, HWND window) {
     const float settings_btn_w = ImGui::CalcTextSize("Settings...").x + style.FramePadding.x * 2.0f;
     const float group_gap = S(14.0f);
 
-    const float total_header_w = new_btn_w + style.ItemSpacing.x + open_btn_w + style.ItemSpacing.x + load_btn_w + style.ItemSpacing.x + save_btn_w
+    const float total_header_w = new_btn_w + style.ItemSpacing.x + open_btn_w + style.ItemSpacing.x + file_btn_w
         + group_gap + name_input_w + style.ItemSpacing.x + playlist_input_w + style.ItemSpacing.x + cover_btn_w
         + group_gap + bitrate_w + style.ItemSpacing.x + norm_w + style.ItemSpacing.x + settings_btn_w;
 
@@ -1315,6 +1383,7 @@ void songs_page(App& app, HWND window) {
             app.rows.clear();
             app.output.clear();
             app.save_file.clear();
+            app.autosave_signature.clear();
             app.thunderstore_read_only = false;
             app.active_playlist_filter.clear();
             app.custom_playlists.clear();
@@ -1339,14 +1408,21 @@ void songs_page(App& app, HWND window) {
             }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Load Save...", ImVec2(load_btn_w, 0))) {
-            const auto files = pick(window, false, false, false, app.save_file.parent_path(), true);
-            if (!files.empty()) { app.save_file = files[0]; open_saved_file(app, files[0]); }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Save As...", ImVec2(save_btn_w, 0))) {
-            const auto file = pick_save(window, app.save_file.empty() ? fs::path(std::string(app.name.data()) + ".rmp") : app.save_file);
-            if (!file.empty()) { app.save_file = file; save_editor_file(app, file); }
+        if (ImGui::Button("File...", ImVec2(file_btn_w, 0))) ImGui::OpenPopup("file_menu");
+        if (ImGui::BeginPopup("file_menu")) {
+            if (ImGui::MenuItem("Load Save...")) {
+                const auto files = pick(window, false, false, false, app.save_file.parent_path(), true);
+                if (!files.empty()) { app.save_file = files[0]; open_saved_file(app, files[0]); }
+            }
+            if (ImGui::MenuItem("Save As...")) {
+                const auto file = pick_save(window, app.save_file.empty() ? fs::path(std::string(app.name.data()) + ".rmp") : app.save_file);
+                if (!file.empty()) { app.save_file = file; save_editor_file(app, file); }
+            }
+            if (ImGui::MenuItem("Save Portable...")) {
+                const auto file = pick_save(window, app.save_file.empty() ? fs::path(std::string(app.name.data()) + ".rmp") : app.save_file);
+                if (!file.empty()) { app.save_file = file; save_portable_file(app, file); }
+            }
+            ImGui::EndPopup();
         }
         ImGui::SameLine(0, group_gap);
         ImGui::SetNextItemWidth(name_input_w);
